@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import os from "node:os";
-import type { AdapterModel } from "@paperclipai/adapter-utils";
+import type { AdapterModel, ListModelsContext } from "@paperclipai/adapter-utils";
 import {
   asString,
   ensurePathInEnv,
@@ -108,20 +108,27 @@ export async function discoverOpenCodeModels(input: {
   const command = resolveOpenCodeCommand(input.command);
   const cwd = asString(input.cwd, process.cwd());
   const env = normalizeEnv(input.env);
-  // Ensure HOME points to the actual running user's home directory.
-  // When the server is started via `runuser -u <user>`, HOME may still
-  // reflect the parent process (e.g. /root), causing OpenCode to miss
-  // provider auth credentials stored under the target user's home.
+  // Prefer process.env.HOME if already set (e.g., in Docker containers where
+  // HOME is explicitly configured). Only fall back to os.userInfo().homedir
+  // when HOME is not set (e.g., when started via `runuser -u <user>` where
+  // HOME may still reflect the parent process).
+  const existingHome = process.env.HOME;
   let resolvedHome: string | undefined;
-  try {
-    resolvedHome = os.userInfo().homedir || undefined;
-  } catch {
-    // os.userInfo() throws a SystemError when the current UID has no
-    // /etc/passwd entry (e.g. `docker run --user 1234` with a minimal
-    // image). Fall back to process.env.HOME.
+  if (existingHome && existingHome.trim().length > 0) {
+    resolvedHome = existingHome.trim();
+  } else {
+    try {
+      resolvedHome = os.userInfo().homedir || undefined;
+    } catch {
+      // os.userInfo() throws a SystemError when the current UID has no
+      // /etc/passwd entry (e.g. `docker run --user 1234` with a minimal
+      // image). Fall back to process.env.HOME.
+    }
   }
   // Prevent OpenCode from writing an opencode.json into the working directory.
   const runtimeEnv = normalizeEnv(ensurePathInEnv({ ...process.env, ...env, ...(resolvedHome ? { HOME: resolvedHome } : {}), OPENCODE_DISABLE_PROJECT_CONFIG: "true" }));
+
+  console.log("[opencode-local] discoverOpenCodeModels: command=%s, cwd=%s, HOME=%s, PATH=%s", command, cwd, runtimeEnv.HOME, runtimeEnv.PATH?.slice(0, 100));
 
   const result = await runChildProcess(
     `opencode-models-${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -136,6 +143,8 @@ export async function discoverOpenCodeModels(input: {
     },
   );
 
+  console.log("[opencode-local] discoverOpenCodeModels: exitCode=%s, stdout=%s, stderr=%s", result.exitCode, result.stdout.slice(0, 500), result.stderr.slice(0, 500));
+
   if (result.timedOut) {
     throw new Error(`\`opencode models\` timed out after ${MODELS_DISCOVERY_TIMEOUT_MS / 1000}s.`);
   }
@@ -144,7 +153,9 @@ export async function discoverOpenCodeModels(input: {
     throw new Error(detail ? `\`opencode models\` failed: ${detail}` : "`opencode models` failed.");
   }
 
-  return sortModels(parseModelsOutput(result.stdout));
+  const models = sortModels(parseModelsOutput(result.stdout));
+  console.log("[opencode-local] discoverOpenCodeModels: discovered %d models: %s", models.length, models.map(m => m.id).join(", "));
+  return models;
 }
 
 export async function discoverOpenCodeModelsCached(input: {
@@ -197,10 +208,17 @@ export async function ensureOpenCodeModelConfiguredAndAvailable(input: {
   return models;
 }
 
-export async function listOpenCodeModels(): Promise<AdapterModel[]> {
+export async function listOpenCodeModels(ctx?: ListModelsContext): Promise<AdapterModel[]> {
   try {
-    return await discoverOpenCodeModelsCached();
-  } catch {
+    console.log("[opencode-local] listOpenCodeModels: ctx=%j", ctx);
+    const models = await discoverOpenCodeModelsCached({
+      cwd: ctx?.cwd,
+      env: ctx?.env,
+    });
+    console.log("[opencode-local] listOpenCodeModels: returning %d models", models.length);
+    return models;
+  } catch (err) {
+    console.error("[opencode-local] listOpenCodeModels: error=%s", err instanceof Error ? err.message : String(err));
     return [];
   }
 }
